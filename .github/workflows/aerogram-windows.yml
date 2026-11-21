@@ -257,6 +257,9 @@ jobs:
         timeout-minutes: 20
         run: |
           $env:QT_FORCE_STDERR_LOGGING = '1'
+          # Keep native QRhi rendering, but avoid Qt 6.11's DXGI vblank-thread
+          # window-registration race on the headless CI desktop.
+          $env:QT_D3D_NO_VBLANK_THREAD = '1'
           Add-Type -TypeDefinition @"
           using System;
           using System.Collections.Generic;
