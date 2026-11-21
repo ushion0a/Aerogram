@@ -267,39 +267,58 @@ jobs:
             $sdkCdb = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Debuggers\x64\cdb.exe'
             if (Test-Path $sdkCdb) { $cdb = Get-Item $sdkCdb }
           }
+          $cdbPath = if ($cdb -is [System.IO.FileInfo]) { $cdb.FullName } elseif ($cdb) { $cdb.Source } else { $null }
           function Save-CrashDiagnostics([string]$test, [int]$processId, [int]$exitCode) {
-            $diagnosticLog = "$env:EVIDENCE_DIR\$test.crash-diagnostics.log"
-            @(
-              "$test exited with $exitCode ('0x{0:X8}' -f ($exitCode -band 0xffffffff))"
-              "Process id: $processId"
-            ) | Tee-Object $diagnosticLog | Out-Host
-            $events = @(Get-WinEvent -FilterHashtable @{
-              LogName = 'Application'
-              StartTime = (Get-Date).AddMinutes(-5)
-            } -ErrorAction SilentlyContinue | Where-Object {
-              ($_.ProviderName -in @('Application Error', 'Windows Error Reporting')) -and
-              ($_.Message -match "(?i)$([regex]::Escape($test))\.exe")
-            } | Select-Object -First 8 TimeCreated, ProviderName, Id, Message)
-            $events | Format-List | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
-            if ($cdb) {
-              # Capture the original crashing thread and stack from a replay of
-              # the already-failed case; never use debugger exit as test exit.
-              $replayOut = Join-Path $env:RUNNER_TEMP "$test.cdb.stdout.log"
-              $replayErr = Join-Path $env:RUNNER_TEMP "$test.cdb.stderr.log"
-              $replay = Start-Process -FilePath $cdb.Source `
-                -ArgumentList @('-g', '-G', '-c', '.ecxr; ~* kp; q', $executable) `
-                -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $replayOut `
-                -RedirectStandardError $replayErr -PassThru -NoNewWindow
-              if (-not $replay.WaitForExit(60000)) {
-                Stop-Process -Id $replay.Id -Force -ErrorAction SilentlyContinue
+            try {
+              $diagnosticLog = "$env:EVIDENCE_DIR\$test.crash-diagnostics.log"
+              $symbolDir = "$env:SOURCE_DIR\out\Debug"
+              $pdbExists = Test-Path (Join-Path $symbolDir "$test.pdb")
+              @(
+                "$test exited with $exitCode ($('0x{0:X8}' -f ($exitCode -band 0xffffffff)))"
+                "Process id: $processId"
+                "Symbol dir: $symbolDir (pdb present: $pdbExists)"
+              ) | Tee-Object $diagnosticLog | Out-Host
+              $events = @(Get-WinEvent -FilterHashtable @{
+                LogName = 'Application'
+                StartTime = (Get-Date).AddMinutes(-5)
+              } -ErrorAction SilentlyContinue | Where-Object {
+                ($_.ProviderName -in @('Application Error', 'Windows Error Reporting')) -and
+                ($_.Message -match "(?i)$([regex]::Escape($test))\.exe")
+              } | Select-Object -First 8 TimeCreated, ProviderName, Id, Message)
+              $events | Format-List | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+              if ($cdbPath) {
+                # Capture the original crashing thread and stack from a replay of
+                # the already-failed case; never use debugger exit as test exit.
+                $replayOut = Join-Path $env:RUNNER_TEMP "$test.cdb.stdout.log"
+                $replayErr = Join-Path $env:RUNNER_TEMP "$test.cdb.stderr.log"
+                Remove-Item $replayOut, $replayErr -Force -ErrorAction SilentlyContinue
+                $cdbArgs = @(
+                  '-lines'
+                  '-g'
+                  '-G'
+                  '-y'
+                  "`"$symbolDir`""
+                  '-c'
+                  '".ecxr; kPn 40; ~* kPn 20; q"'
+                  "`"$executable`""
+                )
+                $replay = Start-Process -FilePath $cdbPath `
+                  -ArgumentList $cdbArgs `
+                  -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $replayOut `
+                  -RedirectStandardError $replayErr -PassThru -NoNewWindow
+                if (-not $replay.WaitForExit(60000)) {
+                  Stop-Process -Id $replay.Id -Force -ErrorAction SilentlyContinue
+                }
+                $replay.WaitForExit()
+                "cdb replay exit: $($replay.ExitCode)" | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+                if (Test-Path $replayOut) { Get-Content $replayOut | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
+                if (Test-Path $replayErr) { Get-Content $replayErr | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
+              } else {
+                'cdb.exe was not available; Application Event Log is the native crash record.' |
+                  Tee-Object -FilePath $diagnosticLog -Append | Out-Host
               }
-              $replay.WaitForExit()
-              "cdb replay exit: $($replay.ExitCode)" | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
-              if (Test-Path $replayOut) { Get-Content $replayOut | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
-              if (Test-Path $replayErr) { Get-Content $replayErr | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
-            } else {
-              'cdb.exe was not available; Application Event Log is the native crash record.' |
-                Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+            } catch {
+              Write-Warning "Save-CrashDiagnostics failed for ${test}: $_"
             }
           }
           Add-Type -TypeDefinition @"
@@ -353,6 +372,17 @@ jobs:
           $failed = $false
           Push-Location "$env:SOURCE_DIR\out\Debug"
           try {
+            # Ensure cache/probe parent folders used by Test::UiIntegration exist.
+            foreach ($testDir in @(
+              'tests\text\emoji',
+              'tests\text\fonts',
+              'tests\test_bot_menu_hold\emoji',
+              'tests\test_bot_menu_hold\fonts',
+              'test\text',
+              'test\test_bot_menu_hold'
+            )) {
+              New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+            }
             foreach ($test in @('test_text', 'test_bot_menu_hold')) {
               $executable = Join-Path (Get-Location) "$test.exe"
               if (-not (Test-Path $executable)) { Write-Error "Missing $executable"; $failed = $true; continue }
