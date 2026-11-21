@@ -234,9 +234,18 @@ jobs:
             'TDESKTOP_API_TEST:BOOL=ON',
             'DESKTOP_APP_TEST_APPS:BOOL=ON',
             'DESKTOP_APP_DISABLE_AUTOUPDATE:BOOL=ON',
-            'CMAKE_CONFIGURATION_TYPES:STRING=Debug'
+            'TDESKTOP_RELEASE_TEST_HARNESS:BOOL=OFF',
+            'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64'
           )) {
             if ($cache -notcontains $expected) { Write-Error "Missing CMake setting: $expected"; exit 1 }
+          }
+          if (-not ($cache | Where-Object { $_ -match '^TDESKTOP_API_ID:(STRING|UNINITIALIZED)=[0-9]+$' })) {
+            Write-Error 'Missing CMake setting: TDESKTOP_API_ID'
+            exit 1
+          }
+          if (-not ($cache | Where-Object { $_ -match '^CMAKE_CONFIGURATION_TYPES:(STRING|UNINITIALIZED)=(.*;)?Debug(;.*)?$' })) {
+            Write-Error 'Missing CMake setting: CMAKE_CONFIGURATION_TYPES including Debug'
+            exit 1
           }
 
       - name: Build application and required tests
@@ -250,6 +259,7 @@ jobs:
           $env:QT_FORCE_STDERR_LOGGING = '1'
           Add-Type -TypeDefinition @"
           using System;
+          using System.Collections.Generic;
           using System.Runtime.InteropServices;
           public static class Win32TestDriver {
               public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -261,33 +271,37 @@ jobs:
               public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
               [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam);
 
-              public static IntPtr FindVisibleWindow(uint pid) {
-                  IntPtr found = IntPtr.Zero;
+              public static IntPtr[] FindVisibleWindows(uint pid) {
+                  List<IntPtr> found = new List<IntPtr>();
                   EnumWindows((hWnd, lParam) => {
                       uint windowPid;
                       GetWindowThreadProcessId(hWnd, out windowPid);
                       if (windowPid == pid && IsWindowVisible(hWnd)) {
-                          found = hWnd;
-                          return false;
+                          found.Add(hWnd);
                       }
                       return true;
                   }, IntPtr.Zero);
-                  return found;
+                  return found.ToArray();
               }
 
-              public static bool PumpAndClose(IntPtr hWnd) {
+              public static bool PumpAndClose(IntPtr[] hWnds) {
+                  if (hWnds == null || hWnds.Length == 0) {
+                      return false;
+                  }
                   UIntPtr result;
                   const uint WM_NULL = 0x0000;
                   const uint WM_CLOSE = 0x0010;
                   const uint SMTO_BLOCK = 0x0001;
-                  if (SendMessageTimeout(hWnd, WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
+                  if (SendMessageTimeout(hWnds[0], WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
                       return false;
                   }
-                  UpdateWindow(hWnd);
-                  if (SendMessageTimeout(hWnd, WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
+                  foreach (IntPtr hWnd in hWnds) {
+                      UpdateWindow(hWnd);
+                  }
+                  if (SendMessageTimeout(hWnds[0], WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
                       return false;
                   }
-                  return PostMessage(hWnd, WM_CLOSE, UIntPtr.Zero, IntPtr.Zero);
+                  return PostMessage(hWnds[0], WM_CLOSE, UIntPtr.Zero, IntPtr.Zero);
               }
           }
           "@
@@ -305,8 +319,8 @@ jobs:
                 $timer = [Diagnostics.Stopwatch]::StartNew()
                 $closedWindow = $false
                 while (-not $proc.HasExited -and $timer.Elapsed.TotalSeconds -lt 180) {
-                  $hwnd = [Win32TestDriver]::FindVisibleWindow([uint32]$proc.Id)
-                  if ($hwnd -ne [IntPtr]::Zero -and [Win32TestDriver]::PumpAndClose($hwnd)) {
+                  $hwnds = [Win32TestDriver]::FindVisibleWindows([uint32]$proc.Id)
+                  if ($hwnds.Length -gt 0 -and [Win32TestDriver]::PumpAndClose($hwnds)) {
                     $closedWindow = $true
                     [void]$proc.WaitForExit(15000)
                     break
@@ -344,7 +358,11 @@ jobs:
           $output = "$env:SOURCE_DIR\out\Debug"
           $application = Get-ChildItem $output -File | Where-Object { $_.Name -in @('Telegram.exe', 'Forkgram.exe', 'Aerogram.exe') }
           if (@($application).Count -ne 1) { Write-Error 'Expected exactly one Telegram.exe, Forkgram.exe, or Aerogram.exe.'; exit 1 }
-          $records = @($application) + @('test_text.exe', 'test_bot_menu_hold.exe' | ForEach-Object { Get-Item (Join-Path $output $_) }) | ForEach-Object {
+          $binaries = @($application) + @(
+            Get-Item (Join-Path $output 'test_text.exe')
+            Get-Item (Join-Path $output 'test_bot_menu_hold.exe')
+          )
+          $records = $binaries | ForEach-Object {
             [ordered]@{
               name = $_.Name
               length = $_.Length
@@ -690,10 +708,17 @@ jobs:
             'DESKTOP_APP_TEST_APPS:BOOL=OFF',
             'DESKTOP_APP_DISABLE_AUTOUPDATE:BOOL=ON',
             'TDESKTOP_RELEASE_TEST_HARNESS:BOOL=OFF',
-            'DESKTOP_APP_ENABLE_LTO:BOOL=OFF',
-            'CMAKE_CONFIGURATION_TYPES:STRING=Release'
+            'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64'
           )) {
             if ($cache -notcontains $expected) { Write-Error "Missing CMake setting: $expected"; exit 1 }
+          }
+          if (-not ($cache | Where-Object { $_ -match '^DESKTOP_APP_ENABLE_LTO:(BOOL|UNINITIALIZED)=OFF$' })) {
+            Write-Error 'Missing CMake setting: DESKTOP_APP_ENABLE_LTO=OFF'
+            exit 1
+          }
+          if (-not ($cache | Where-Object { $_ -match '^CMAKE_CONFIGURATION_TYPES:(STRING|UNINITIALIZED)=(.*;)?Release(;.*)?$' })) {
+            Write-Error 'Missing CMake setting: CMAKE_CONFIGURATION_TYPES including Release'
+            exit 1
           }
           if ($cache -match 'TDESKTOP_API_ID:STRING=17349') { Write-Error 'Release configuration contains TEST ONLY credentials.'; exit 1 }
 
