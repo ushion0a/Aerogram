@@ -66,7 +66,39 @@ jobs:
           $submoduleStatus | Out-File "$env:EVIDENCE_DIR\submodule-status.txt"
           $submoduleDirty = git -C $env:SOURCE_DIR submodule foreach --recursive --quiet 'git status --porcelain=v1 --untracked-files=all'
           $submoduleDirty | Out-File "$env:EVIDENCE_DIR\submodule-worktree-status.txt"
-          if ($sourceStatus -or $submoduleDirty -or ($submoduleStatus | Where-Object { -not $_.StartsWith(' ') })) {
+          $invalidSubmodules = @($submoduleStatus | Where-Object {
+            if ($_.StartsWith(' ')) { return $false }
+            if ($_ -notmatch '^-[0-9a-f]+\s+(\S+)') { return $true }
+            $parts = $Matches[1] -split '/'
+            for ($i = $parts.Length - 1; $i -ge 0; $i--) {
+              $parentRel = if ($i -gt 0) { ($parts[0..($i - 1)] -join '/') } else { '' }
+              $childRel = ($parts[$i..($parts.Length - 1)] -join '/')
+              $gitmodules = if ($parentRel) { Join-Path $env:SOURCE_DIR "$parentRel/.gitmodules" } else { Join-Path $env:SOURCE_DIR '.gitmodules' }
+              if (Test-Path -LiteralPath $gitmodules) {
+                $pathEntries = @(git config --file $gitmodules --name-only --get-regexp '^submodule\..*\.path$' "^$([regex]::Escape($childRel))$" 2>$null)
+                foreach ($entry in $pathEntries) {
+                  $updateKey = $entry -replace '\.path$', '.update'
+                  if ((git config --file $gitmodules --get $updateKey 2>$null) -eq 'none') { return $false }
+                }
+                if ($pathEntries) { break }
+              }
+            }
+            return $true
+          })
+          $global:LASTEXITCODE = 0
+          if ($sourceStatus -or $submoduleDirty -or $invalidSubmodules) {
+            if ($sourceStatus) {
+              Write-Host 'Offending source status lines:'
+              $sourceStatus | ForEach-Object { Write-Host "  $_" }
+            }
+            if ($submoduleDirty) {
+              Write-Host 'Offending dirty submodule worktree lines:'
+              $submoduleDirty | ForEach-Object { Write-Host "  $_" }
+            }
+            if ($invalidSubmodules) {
+              Write-Host 'Offending submodule status lines:'
+              $invalidSubmodules | ForEach-Object { Write-Host "  $_" }
+            }
             Write-Error 'Source or submodules are missing, modified, or not at their pinned commits.'
             exit 1
           }
@@ -408,7 +440,39 @@ jobs:
           $submoduleStatus | Out-File "$env:EVIDENCE_DIR\submodule-status.txt"
           $submoduleDirty = git -C $env:SOURCE_DIR submodule foreach --recursive --quiet 'git status --porcelain=v1 --untracked-files=all'
           $submoduleDirty | Out-File "$env:EVIDENCE_DIR\submodule-worktree-status.txt"
-          if ($sourceStatus -or $submoduleDirty -or ($submoduleStatus | Where-Object { -not $_.StartsWith(' ') })) {
+          $invalidSubmodules = @($submoduleStatus | Where-Object {
+            if ($_.StartsWith(' ')) { return $false }
+            if ($_ -notmatch '^-[0-9a-f]+\s+(\S+)') { return $true }
+            $parts = $Matches[1] -split '/'
+            for ($i = $parts.Length - 1; $i -ge 0; $i--) {
+              $parentRel = if ($i -gt 0) { ($parts[0..($i - 1)] -join '/') } else { '' }
+              $childRel = ($parts[$i..($parts.Length - 1)] -join '/')
+              $gitmodules = if ($parentRel) { Join-Path $env:SOURCE_DIR "$parentRel/.gitmodules" } else { Join-Path $env:SOURCE_DIR '.gitmodules' }
+              if (Test-Path -LiteralPath $gitmodules) {
+                $pathEntries = @(git config --file $gitmodules --name-only --get-regexp '^submodule\..*\.path$' "^$([regex]::Escape($childRel))$" 2>$null)
+                foreach ($entry in $pathEntries) {
+                  $updateKey = $entry -replace '\.path$', '.update'
+                  if ((git config --file $gitmodules --get $updateKey 2>$null) -eq 'none') { return $false }
+                }
+                if ($pathEntries) { break }
+              }
+            }
+            return $true
+          })
+          $global:LASTEXITCODE = 0
+          if ($sourceStatus -or $submoduleDirty -or $invalidSubmodules) {
+            if ($sourceStatus) {
+              Write-Host 'Offending source status lines:'
+              $sourceStatus | ForEach-Object { Write-Host "  $_" }
+            }
+            if ($submoduleDirty) {
+              Write-Host 'Offending dirty submodule worktree lines:'
+              $submoduleDirty | ForEach-Object { Write-Host "  $_" }
+            }
+            if ($invalidSubmodules) {
+              Write-Host 'Offending submodule status lines:'
+              $invalidSubmodules | ForEach-Object { Write-Host "  $_" }
+            }
             Write-Error 'Source or submodules are missing, modified, or not at their pinned commits.'
             exit 1
           }
