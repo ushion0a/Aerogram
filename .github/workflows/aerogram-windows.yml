@@ -257,9 +257,51 @@ jobs:
         timeout-minutes: 20
         run: |
           $env:QT_FORCE_STDERR_LOGGING = '1'
-          # Keep native QRhi rendering, but avoid Qt 6.11's DXGI vblank-thread
-          # window-registration race on the headless CI desktop.
-          $env:QT_D3D_NO_VBLANK_THREAD = '1'
+          # A hosted runner has no physical GPU/display output. Selecting WARP
+          # makes lib_ui reject QRhi (CpuDevice) and use native raster windows;
+          # keep HWNDs real because test_text exits only after WM_CLOSE.
+          $env:QSG_RHI_PREFER_SOFTWARE_RENDERER = '1'
+          $env:QT_LOGGING_RULES = 'qt.qpa.backingstore=true;qt.rhi.*=true'
+          $cdb = Get-Command cdb.exe -ErrorAction SilentlyContinue
+          if (-not $cdb) {
+            $sdkCdb = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Debuggers\x64\cdb.exe'
+            if (Test-Path $sdkCdb) { $cdb = Get-Item $sdkCdb }
+          }
+          function Save-CrashDiagnostics([string]$test, [int]$processId, [int]$exitCode) {
+            $diagnosticLog = "$env:EVIDENCE_DIR\$test.crash-diagnostics.log"
+            @(
+              "$test exited with $exitCode ('0x{0:X8}' -f ($exitCode -band 0xffffffff))"
+              "Process id: $processId"
+            ) | Tee-Object $diagnosticLog | Out-Host
+            $events = @(Get-WinEvent -FilterHashtable @{
+              LogName = 'Application'
+              StartTime = (Get-Date).AddMinutes(-5)
+            } -ErrorAction SilentlyContinue | Where-Object {
+              ($_.ProviderName -in @('Application Error', 'Windows Error Reporting')) -and
+              ($_.Message -match "(?i)$([regex]::Escape($test))\.exe")
+            } | Select-Object -First 8 TimeCreated, ProviderName, Id, Message)
+            $events | Format-List | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+            if ($cdb) {
+              # Capture the original crashing thread and stack from a replay of
+              # the already-failed case; never use debugger exit as test exit.
+              $replayOut = Join-Path $env:RUNNER_TEMP "$test.cdb.stdout.log"
+              $replayErr = Join-Path $env:RUNNER_TEMP "$test.cdb.stderr.log"
+              $replay = Start-Process -FilePath $cdb.Source `
+                -ArgumentList @('-g', '-G', '-c', '.ecxr; ~* kp; q', $executable) `
+                -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $replayOut `
+                -RedirectStandardError $replayErr -PassThru -NoNewWindow
+              if (-not $replay.WaitForExit(60000)) {
+                Stop-Process -Id $replay.Id -Force -ErrorAction SilentlyContinue
+              }
+              $replay.WaitForExit()
+              "cdb replay exit: $($replay.ExitCode)" | Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+              if (Test-Path $replayOut) { Get-Content $replayOut | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
+              if (Test-Path $replayErr) { Get-Content $replayErr | Tee-Object -FilePath $diagnosticLog -Append | Out-Host }
+            } else {
+              'cdb.exe was not available; Application Event Log is the native crash record.' |
+                Tee-Object -FilePath $diagnosticLog -Append | Out-Host
+            }
+          }
           Add-Type -TypeDefinition @"
           using System;
           using System.Collections.Generic;
@@ -347,7 +389,10 @@ jobs:
               }
               $combined | Tee-Object "$env:EVIDENCE_DIR\$test.log" | Out-Host
               Set-Content "$env:EVIDENCE_DIR\$test.exit-code.txt" $exitCode
-              if ($exitCode -ne 0) { $failed = $true }
+              if ($exitCode -ne 0) {
+                $failed = $true
+                Save-CrashDiagnostics $test $proc.Id $exitCode
+              }
               if ($test -eq 'test_bot_menu_hold' -and (($combined -join "`n") -match '([1-9][0-9]*)\s+failures')) {
                 Write-Error "test_bot_menu_hold reported failures in log output."
                 $failed = $true
