@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="-12 -12 280 280">
+  <title>Aerogram — glass wing</title>
+  <defs>
+    <linearGradient id="vane" gradientUnits="userSpaceOnUse" x1="102" y1="57" x2="128" y2="153">
+      <stop stop-color="#f0fffd"/>
+      <stop offset=".38" stop-color="#79f4ed"/>
+      <stop offset=".65" stop-color="#21cdda"/>
+      <stop offset="1" stop-color="#007eac"/>
+    </linearGradient>
+    <linearGradient id="keel" gradientUnits="userSpaceOnUse" x1="122" y1="120" x2="173" y2="178">
+      <stop stop-color="#143f87"/>
+      <stop offset=".48" stop-color="#176aaa"/>
+      <stop offset=".51" stop-color="#178ac9"/>
+      <stop offset="1" stop-color="#49d4ea"/>
+    </linearGradient>
+  </defs>
+  <path d="M19 134Q61 62 232 25Q241 23 238 34Q208 157 125 226Q120 230 118 222L103 163L24 145Q14 143 19 134Z" fill="url(#vane)" stroke="#114762" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M105 160Q163 113 231 36Q200 156 122 222Z" fill="url(#keel)"/>
+  <path d="M27 135Q80 66 216 36Q127 71 82 115Q56 116 27 135Z" fill="#f4fffc" fill-opacity=".78"/>
+  <path d="M101 158Q169 105 231 36Q175 112 111 166L119 205Z" fill="#d8fffc"/>
+</svg>
