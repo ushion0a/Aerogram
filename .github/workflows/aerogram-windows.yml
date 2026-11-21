@@ -1,0 +1,710 @@
+name: Aerogram Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Windows build and verification mode
+        type: choice
+        options:
+          - debug_baseline
+          - release_portable
+        default: debug_baseline
+  push:
+    branches:
+      - aerogram
+      - aerogram-*
+  pull_request:
+    branches:
+      - aerogram
+      - aerogram-*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aerogram-windows-x64-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.build_mode || 'debug_baseline' }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64-debug-baseline:
+    name: Windows x64 Debug baseline
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.build_mode == 'debug_baseline')
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      PREPARE_PATH: Telegram/build/prepare/prepare.py
+      REPO_NAME: tdesktop
+      BUILD_CONFIGURATION: Debug
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Prepare the x64 build layout
+        run: |
+          $root = if (Test-Path 'D:\') { 'D:\TBuild' } else { "$env:USERPROFILE\TBuild" }
+          New-Item -ItemType Directory -Path "$root\Libraries" -Force | Out-Null
+          cmd.exe /d /c mklink /d "$env:GITHUB_WORKSPACE\TBuild" "$root"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "TBUILD=$env:GITHUB_WORKSPACE\TBuild" >> $env:GITHUB_ENV
+          "SOURCE_DIR=$env:GITHUB_WORKSPACE\TBuild\$env:REPO_NAME" >> $env:GITHUB_ENV
+          "LibrariesPath=$env:GITHUB_WORKSPACE\TBuild\Libraries\win64" >> $env:GITHUB_ENV
+          "EVIDENCE_DIR=$env:GITHUB_WORKSPACE\ci-evidence\windows-debug" >> $env:GITHUB_ENV
+
+      - name: Check out all pinned submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: Verify pristine source and submodules
+        run: |
+          New-Item -ItemType Directory -Path $env:EVIDENCE_DIR -Force | Out-Null
+          $sourceStatus = git -C $env:SOURCE_DIR status --porcelain=v1 --untracked-files=all
+          $sourceStatus | Out-File "$env:EVIDENCE_DIR\source-status.txt"
+          $submoduleStatus = git -C $env:SOURCE_DIR submodule status --recursive
+          $submoduleStatus | Out-File "$env:EVIDENCE_DIR\submodule-status.txt"
+          $submoduleDirty = git -C $env:SOURCE_DIR submodule foreach --recursive --quiet 'git status --porcelain=v1 --untracked-files=all'
+          $submoduleDirty | Out-File "$env:EVIDENCE_DIR\submodule-worktree-status.txt"
+          if ($sourceStatus -or $submoduleDirty -or ($submoduleStatus | Where-Object { -not $_.StartsWith(' ') })) {
+            Write-Error 'Source or submodules are missing, modified, or not at their pinned commits.'
+            exit 1
+          }
+
+      - name: Resolve SDK and dependency cache identity
+        run: |
+          $document = Get-Content "$env:SOURCE_DIR\docs\building-win.md" -Raw
+          $sdkMatch = [regex]::Match($document, '\*\*(?<sdk>[0-9.]+)\*\* SDK version')
+          if (-not $sdkMatch.Success) { Write-Error 'Windows SDK version not found.'; exit 1 }
+          "SDK=$($sdkMatch.Groups['sdk'].Value)" >> $env:GITHUB_ENV
+          $prepareHash = (Get-FileHash "$env:SOURCE_DIR\$env:PREPARE_PATH" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $identity = "$prepareHash`n$($sdkMatch.Groups['sdk'].Value)`ndebug`n"
+          $bytes = [Text.Encoding]::UTF8.GetBytes($identity)
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          "CACHE_KEY=$hash" >> $env:GITHUB_ENV
+          git config --global user.email '[EMAIL]'
+          git config --global user.name 'Aerogram CI'
+
+      - name: Match the documented MSVC debug setup
+        shell: bash
+        run: sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+      - name: Select the x64 native toolchain
+        uses: Eden-CI/msvc-dev-cmd@master
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: Check the native target architecture
+        run: |
+          if ($env:Platform -ne 'x64') { Write-Error "Expected x64, got '$env:Platform'."; exit 1 }
+
+      - name: Configure NuGet
+        shell: cmd
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Restore ThirdParty cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: aerogram-windows-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-third-party-
+
+      - name: Restore Libraries cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-libs-
+
+      - name: Restore Qt cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-qt-
+
+      - name: Prepare Debug dependencies
+        timeout-minutes: 285
+        shell: cmd
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent > %EVIDENCE_DIR%\prepare.log 2>&1
+          exit /b %errorlevel%
+
+      - name: Save ThirdParty cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: aerogram-windows-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Libraries cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Qt cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Trim dependency intermediates
+        if: always()
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          find "$LibrariesPath" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/qt6_windows7/*' -o -path '*/nv-codec-headers/*' -o -path '*/src/wallet_engine/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: Configure Debug with test applications
+        run: |
+          Push-Location "$env:SOURCE_DIR\Telegram"
+          try {
+            $arguments = @(
+              'x64',
+              '-D', 'TDESKTOP_API_TEST=ON',
+              '-D', 'DESKTOP_APP_TEST_APPS=ON',
+              '-D', 'DESKTOP_APP_DISABLE_AUTOUPDATE=ON',
+              '-D', 'DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF',
+              '-D', 'CMAKE_CONFIGURATION_TYPES=Debug',
+              '-D', 'CMAKE_COMPILE_WARNING_AS_ERROR=ON',
+              '-D', 'CMAKE_MSVC_DEBUG_INFORMATION_FORMAT='
+            )
+            & .\configure.bat @arguments 2>&1 | Tee-Object "$env:EVIDENCE_DIR\configure.log"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+
+      - name: Verify Debug configuration
+        run: |
+          $cache = Get-Content "$env:SOURCE_DIR\out\CMakeCache.txt"
+          Copy-Item "$env:SOURCE_DIR\out\CMakeCache.txt" "$env:EVIDENCE_DIR\CMakeCache.txt"
+          foreach ($expected in @(
+            'TDESKTOP_API_TEST:BOOL=ON',
+            'DESKTOP_APP_TEST_APPS:BOOL=ON',
+            'DESKTOP_APP_DISABLE_AUTOUPDATE:BOOL=ON',
+            'CMAKE_CONFIGURATION_TYPES:STRING=Debug'
+          )) {
+            if ($cache -notcontains $expected) { Write-Error "Missing CMake setting: $expected"; exit 1 }
+          }
+
+      - name: Build application and required tests
+        run: |
+          & cmake --build "$env:SOURCE_DIR\out" --config Debug --target Telegram test_text test_bot_menu_hold --parallel 2 2>&1 | Tee-Object "$env:EVIDENCE_DIR\build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Execute test_text and test_bot_menu_hold
+        timeout-minutes: 20
+        run: |
+          $env:QT_FORCE_STDERR_LOGGING = '1'
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win32TestDriver {
+              public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+              [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+              [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+              [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+              [DllImport("user32.dll")] public static extern bool UpdateWindow(IntPtr hWnd);
+              [DllImport("user32.dll", SetLastError = true)]
+              public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+              [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam);
+
+              public static IntPtr FindVisibleWindow(uint pid) {
+                  IntPtr found = IntPtr.Zero;
+                  EnumWindows((hWnd, lParam) => {
+                      uint windowPid;
+                      GetWindowThreadProcessId(hWnd, out windowPid);
+                      if (windowPid == pid && IsWindowVisible(hWnd)) {
+                          found = hWnd;
+                          return false;
+                      }
+                      return true;
+                  }, IntPtr.Zero);
+                  return found;
+              }
+
+              public static bool PumpAndClose(IntPtr hWnd) {
+                  UIntPtr result;
+                  const uint WM_NULL = 0x0000;
+                  const uint WM_CLOSE = 0x0010;
+                  const uint SMTO_BLOCK = 0x0001;
+                  if (SendMessageTimeout(hWnd, WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
+                      return false;
+                  }
+                  UpdateWindow(hWnd);
+                  if (SendMessageTimeout(hWnd, WM_NULL, UIntPtr.Zero, IntPtr.Zero, SMTO_BLOCK, 5000, out result) == IntPtr.Zero) {
+                      return false;
+                  }
+                  return PostMessage(hWnd, WM_CLOSE, UIntPtr.Zero, IntPtr.Zero);
+              }
+          }
+          "@
+          $failed = $false
+          Push-Location "$env:SOURCE_DIR\out\Debug"
+          try {
+            foreach ($test in @('test_text', 'test_bot_menu_hold')) {
+              $executable = Join-Path (Get-Location) "$test.exe"
+              if (-not (Test-Path $executable)) { Write-Error "Missing $executable"; $failed = $true; continue }
+              $outFile = Join-Path $env:RUNNER_TEMP "$test.stdout.log"
+              $errFile = Join-Path $env:RUNNER_TEMP "$test.stderr.log"
+              Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+              $proc = Start-Process -FilePath $executable -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
+              if ($test -eq 'test_text') {
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                $closedWindow = $false
+                while (-not $proc.HasExited -and $timer.Elapsed.TotalSeconds -lt 180) {
+                  $hwnd = [Win32TestDriver]::FindVisibleWindow([uint32]$proc.Id)
+                  if ($hwnd -ne [IntPtr]::Zero -and [Win32TestDriver]::PumpAndClose($hwnd)) {
+                    $closedWindow = $true
+                    [void]$proc.WaitForExit(15000)
+                    break
+                  }
+                  [void]$proc.WaitForExit(200)
+                }
+              } else {
+                [void]$proc.WaitForExit(180000)
+              }
+              if (-not $proc.HasExited) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $exitCode = 124
+              } else {
+                $exitCode = $proc.ExitCode
+              }
+              $combined = @()
+              if (Test-Path $outFile) { $combined += Get-Content $outFile }
+              if (Test-Path $errFile) { $combined += Get-Content $errFile }
+              if ($test -eq 'test_text' -and $closedWindow) {
+                $combined += "test_text: GUI Expects and paintRequest completed; window closed cleanly via WM_CLOSE (exit $exitCode)"
+              }
+              $combined | Tee-Object "$env:EVIDENCE_DIR\$test.log" | Out-Host
+              Set-Content "$env:EVIDENCE_DIR\$test.exit-code.txt" $exitCode
+              if ($exitCode -ne 0) { $failed = $true }
+              if ($test -eq 'test_bot_menu_hold' -and (($combined -join "`n") -match '([1-9][0-9]*)\s+failures')) {
+                Write-Error "test_bot_menu_hold reported failures in log output."
+                $failed = $true
+              }
+            }
+          } finally { Pop-Location }
+          if ($failed) { exit 1 }
+
+      - name: Record binary hashes and metadata
+        run: |
+          $output = "$env:SOURCE_DIR\out\Debug"
+          $application = Get-ChildItem $output -File | Where-Object { $_.Name -in @('Telegram.exe', 'Forkgram.exe', 'Aerogram.exe') }
+          if (@($application).Count -ne 1) { Write-Error 'Expected exactly one Telegram.exe, Forkgram.exe, or Aerogram.exe.'; exit 1 }
+          $records = @($application) + @('test_text.exe', 'test_bot_menu_hold.exe' | ForEach-Object { Get-Item (Join-Path $output $_) }) | ForEach-Object {
+            [ordered]@{
+              name = $_.Name
+              length = $_.Length
+              last_write_time_utc = $_.LastWriteTimeUtc.ToString('o')
+              sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $records | ConvertTo-Json | Set-Content "$env:EVIDENCE_DIR\binary-metadata.json"
+          "APPLICATION_BINARY=$($application.Name)" >> $env:GITHUB_ENV
+          $application.Name | Set-Content "$env:EVIDENCE_DIR\application-binary.txt"
+
+      - name: Upload Debug build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: aerogram-windows-x64-debug-evidence
+          path: ci-evidence/windows-debug/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-x64-release-portable:
+    name: Windows x64 Release portable
+    if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release_portable'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      PREPARE_PATH: Telegram/build/prepare/prepare.py
+      REPO_NAME: tdesktop
+      BUILD_CONFIGURATION: Release
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate private API credentials without exposing values
+        env:
+          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID || secrets.TELEGRAM_API_ID }}
+          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH || secrets.TELEGRAM_API_HASH }}
+        run: |
+          if ($env:TDESKTOP_API_ID -notmatch '^[0-9]+$') { Write-Error 'TDESKTOP_API_ID is missing or not numeric.'; exit 1 }
+          if ($env:TDESKTOP_API_ID -eq '17349') { Write-Error 'The upstream TEST ONLY API ID is forbidden for portable releases.'; exit 1 }
+          if ($env:TDESKTOP_API_HASH -notmatch '^[0-9a-fA-F]{32}$') { Write-Error 'TDESKTOP_API_HASH is missing or invalid.'; exit 1 }
+          if ($env:TDESKTOP_API_HASH -ieq '[SECRET]') { Write-Error 'The upstream TEST ONLY API hash is forbidden for portable releases.'; exit 1 }
+          Write-Host 'Private release API credentials passed validation.'
+
+      - name: Free up runner disk space
+        run: |
+          $targets = @(
+            'C:\Android', 'C:\Miniconda', 'C:\Julia',
+            'C:\Program Files\MongoDB', 'C:\Program Files\MySQL',
+            'C:\Program Files\PostgreSQL', 'C:\Program Files\Amazon',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server',
+            'C:\Program Files (x86)\Google', 'C:\Program Files\R',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\node', 'C:\hostedtoolcache\windows\PyPy',
+            'C:\tools\kotlinc', 'C:\SeleniumWebDrivers'
+          )
+          foreach ($target in $targets) {
+            if (Test-Path $target) { Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue }
+          }
+
+      - name: Extend the pagefile
+        uses: al-cheb/configure-pagefile-action@v1.3
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: 'C:'
+
+      - name: Prepare the x64 build layout
+        run: |
+          $root = if (Test-Path 'D:\') { 'D:\TBuild' } else { "$env:USERPROFILE\TBuild" }
+          New-Item -ItemType Directory -Path "$root\Libraries" -Force | Out-Null
+          cmd.exe /d /c mklink /d "$env:GITHUB_WORKSPACE\TBuild" "$root"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "TBUILD=$env:GITHUB_WORKSPACE\TBuild" >> $env:GITHUB_ENV
+          "SOURCE_DIR=$env:GITHUB_WORKSPACE\TBuild\$env:REPO_NAME" >> $env:GITHUB_ENV
+          "LibrariesPath=$env:GITHUB_WORKSPACE\TBuild\Libraries\win64" >> $env:GITHUB_ENV
+          "EVIDENCE_DIR=$env:RUNNER_TEMP\aerogram-release-build" >> $env:GITHUB_ENV
+
+      - name: Check out all pinned submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: Verify pristine source and submodules
+        run: |
+          New-Item -ItemType Directory -Path $env:EVIDENCE_DIR -Force | Out-Null
+          $sourceStatus = git -C $env:SOURCE_DIR status --porcelain=v1 --untracked-files=all
+          $sourceStatus | Out-File "$env:EVIDENCE_DIR\source-status.txt"
+          $submoduleStatus = git -C $env:SOURCE_DIR submodule status --recursive
+          $submoduleStatus | Out-File "$env:EVIDENCE_DIR\submodule-status.txt"
+          $submoduleDirty = git -C $env:SOURCE_DIR submodule foreach --recursive --quiet 'git status --porcelain=v1 --untracked-files=all'
+          $submoduleDirty | Out-File "$env:EVIDENCE_DIR\submodule-worktree-status.txt"
+          if ($sourceStatus -or $submoduleDirty -or ($submoduleStatus | Where-Object { -not $_.StartsWith(' ') })) {
+            Write-Error 'Source or submodules are missing, modified, or not at their pinned commits.'
+            exit 1
+          }
+
+      - name: Resolve SDK and dependency cache identity
+        run: |
+          $document = Get-Content "$env:SOURCE_DIR\docs\building-win.md" -Raw
+          $sdkMatch = [regex]::Match($document, '\*\*(?<sdk>[0-9.]+)\*\* SDK version')
+          if (-not $sdkMatch.Success) { Write-Error 'Windows SDK version not found.'; exit 1 }
+          "SDK=$($sdkMatch.Groups['sdk'].Value)" >> $env:GITHUB_ENV
+          $prepareHash = (Get-FileHash "$env:SOURCE_DIR\$env:PREPARE_PATH" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $identity = "$prepareHash`n$($sdkMatch.Groups['sdk'].Value)`nrelease`n"
+          $bytes = [Text.Encoding]::UTF8.GetBytes($identity)
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          "CACHE_KEY=$hash" >> $env:GITHUB_ENV
+          git config --global user.email '[EMAIL]'
+          git config --global user.name 'Aerogram CI'
+
+      - name: Match the documented MSVC debug setup
+        shell: bash
+        run: sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+      - name: Select the x64 native toolchain
+        uses: Eden-CI/msvc-dev-cmd@master
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: Check the native target architecture
+        run: |
+          if ($env:Platform -ne 'x64') { Write-Error "Expected x64, got '$env:Platform'."; exit 1 }
+
+      - name: Configure NuGet
+        shell: cmd
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Make ATL available
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $preferred = Join-Path $env:VCToolsInstallDir 'atlmfc'
+          function Find-AtlRoot {
+            if (Test-Path (Join-Path $preferred 'include\atlbase.h')) { return $preferred }
+            $found = Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { return (Split-Path (Split-Path $found.FullName -Parent) -Parent) }
+            return $null
+          }
+          $atlRoot = Find-AtlRoot
+          if (-not $atlRoot) {
+            Write-Host 'ATL is not installed, adding Microsoft.VisualStudio.Component.VC.ATL.'
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+              'modify', '--installPath', "`"$vs`"", `
+              '--add', 'Microsoft.VisualStudio.Component.VC.ATL', `
+              '--quiet', '--norestart', '--nocache'
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Error "vs_installer failed with $($p.ExitCode)"; exit 1
+            }
+            $atlRoot = Find-AtlRoot
+          }
+          if (-not $atlRoot) { Write-Error 'Required x64 ATL component is missing.'; exit 1 }
+          $legacy = Join-Path $vs 'VC\atlmfc'
+          if (-not (Test-Path $legacy)) { New-Item -ItemType Junction -Path $legacy -Target $atlRoot | Out-Null }
+          if ($preferred -ne $legacy -and -not (Test-Path $preferred)) { New-Item -ItemType Junction -Path $preferred -Target $atlRoot | Out-Null }
+          foreach ($probe in @(
+            (Join-Path $legacy 'include\atlbase.h'),
+            (Join-Path $legacy 'include\atlcomcli.h'),
+            (Join-Path $preferred 'lib\x64\atls.lib')
+          )) {
+            if (-not (Test-Path $probe)) { Write-Error "Unreachable ATL dependency: $probe"; exit 1 }
+          }
+
+      - name: Restore ThirdParty cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: aerogram-windows-x64-release-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-release-third-party-
+
+      - name: Restore Libraries cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-release-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-release-libs-
+
+      - name: Restore Qt cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-release-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: aerogram-windows-x64-release-qt-
+
+      - name: Heal stale Release cache keys
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          drop() {
+            rm -f "$LibrariesPath/cache_keys/$1"
+            echo "$2, dropped the $1 cache key"
+          }
+          [ -f "$LibrariesPath/yy_thunks/objs/x64/YY_Thunks_for_Win7.lib" ] || drop yy_thunks "YY-Thunks library missing"
+          [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] || drop tg_angle "ANGLE library missing"
+          [ -f "$LibrariesPath/nv-codec-headers/Makefile" ] || drop nv-codec-headers "nv-codec-headers makefile missing"
+          if [ -z "$(ls -A "$LibrariesPath/local/lib/pkgconfig" 2>/dev/null)" ]; then
+            for lib in dav1d openh264 opus libvpx; do drop $lib "pkg-config files missing"; done
+          fi
+
+      - name: Prepare Release dependencies
+        timeout-minutes: 285
+        shell: cmd
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent > %EVIDENCE_DIR%\prepare.log 2>&1
+          exit /b %errorlevel%
+
+      - name: Save ThirdParty cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: aerogram-windows-x64-release-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Libraries cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-release-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Qt cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: aerogram-windows-x64-release-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Release failure evidence
+        if: failure()
+        run: |
+          $destination = "$env:GITHUB_WORKSPACE\ci-evidence\windows-release-failure"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Copy-Item "$env:EVIDENCE_DIR\source-status.txt" $destination -Force
+          Copy-Item "$env:EVIDENCE_DIR\submodule-status.txt" $destination -Force
+          foreach ($log in @('prepare.log', 'configure.log', 'build.log')) {
+            if (Test-Path "$env:EVIDENCE_DIR\$log") { Copy-Item "$env:EVIDENCE_DIR\$log" $destination -Force }
+          }
+
+      - name: Upload Release preparation log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: aerogram-windows-x64-release-failure-evidence
+          path: ci-evidence/windows-release-failure/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Trim dependency intermediates
+        if: always()
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          find "$LibrariesPath" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/qt6_windows7/*' -o -path '*/yy_thunks/*' -o -path '*/nv-codec-headers/*' -o -path '*/gas-preprocessor/*' -o -path '*/src/wallet_engine/*' ')' -type f ')' -o -empty ')' -delete || true
+
+      - name: Configure Release with private credentials
+        env:
+          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID || secrets.TELEGRAM_API_ID }}
+          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH || secrets.TELEGRAM_API_HASH }}
+        run: |
+          Push-Location "$env:SOURCE_DIR\Telegram"
+          try {
+            $arguments = @(
+              'x64',
+              '-D', "TDESKTOP_API_ID=$env:TDESKTOP_API_ID",
+              '-D', "TDESKTOP_API_HASH=$env:TDESKTOP_API_HASH",
+              '-D', 'TDESKTOP_API_TEST=OFF',
+              '-D', 'DESKTOP_APP_TEST_APPS=OFF',
+              '-D', 'DESKTOP_APP_DISABLE_AUTOUPDATE=ON',
+              '-D', 'DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF',
+              '-D', 'TDESKTOP_RELEASE_TEST_HARNESS=OFF',
+              '-D', 'DESKTOP_APP_ENABLE_LTO=OFF',
+              '-D', 'CMAKE_CONFIGURATION_TYPES=Release',
+              '-D', 'CMAKE_COMPILE_WARNING_AS_ERROR=ON',
+              '-D', 'CMAKE_MSVC_DEBUG_INFORMATION_FORMAT='
+            )
+            & .\configure.bat @arguments 2>&1 | Tee-Object "$env:EVIDENCE_DIR\configure.log"
+            $exitCode = $LASTEXITCODE
+            $configureLog = Get-Content "$env:EVIDENCE_DIR\configure.log" -Raw
+            $configureLog = $configureLog.Replace($env:TDESKTOP_API_ID, '[redacted-api-id]').Replace($env:TDESKTOP_API_HASH, '[redacted-api-hash]')
+            Set-Content "$env:EVIDENCE_DIR\configure.log" $configureLog
+            if ($exitCode -ne 0) { exit $exitCode }
+          } finally { Pop-Location }
+
+      - name: Verify Release configuration
+        run: |
+          $cache = Get-Content "$env:SOURCE_DIR\out\CMakeCache.txt"
+          foreach ($expected in @(
+            'TDESKTOP_API_TEST:BOOL=OFF',
+            'DESKTOP_APP_TEST_APPS:BOOL=OFF',
+            'DESKTOP_APP_DISABLE_AUTOUPDATE:BOOL=ON',
+            'TDESKTOP_RELEASE_TEST_HARNESS:BOOL=OFF',
+            'DESKTOP_APP_ENABLE_LTO:BOOL=OFF',
+            'CMAKE_CONFIGURATION_TYPES:STRING=Release'
+          )) {
+            if ($cache -notcontains $expected) { Write-Error "Missing CMake setting: $expected"; exit 1 }
+          }
+          if ($cache -match 'TDESKTOP_API_ID:STRING=17349') { Write-Error 'Release configuration contains TEST ONLY credentials.'; exit 1 }
+
+      - name: Build the Release application
+        env:
+          _CL_: /MP2
+        run: |
+          & cmake --build "$env:SOURCE_DIR\out" --config Release --target Telegram --parallel 2 2>&1 | Tee-Object "$env:EVIDENCE_DIR\build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package and inspect the portable ZIP
+        run: |
+          $release = "$env:SOURCE_DIR\out\Release"
+          $application = Get-ChildItem $release -File | Where-Object { $_.Name -in @('Telegram.exe', 'Forkgram.exe', 'Aerogram.exe') }
+          if (@($application).Count -ne 1) { Write-Error 'Expected exactly one Telegram.exe, Forkgram.exe, or Aerogram.exe.'; exit 1 }
+          $packageBase = "$env:GITHUB_WORKSPACE\deploy\package"
+          $portable = Join-Path $packageBase 'Aerogram'
+          New-Item -ItemType Directory -Path "$portable\TelegramForcePortable" -Force | Out-Null
+          New-Item -ItemType File -Path "$portable\TelegramForcePortable\portable" -Force | Out-Null
+          Copy-Item $application.FullName $portable
+          Copy-Item "$env:SOURCE_DIR\LICENSE" $portable
+          Copy-Item "$env:SOURCE_DIR\LEGAL" $portable
+          $d3d = Join-Path $release 'modules\x64\d3d\d3dcompiler_47.dll'
+          if (-not (Test-Path $d3d)) { Write-Error "Missing portable runtime dependency: $d3d"; exit 1 }
+          New-Item -ItemType Directory -Path "$portable\modules\x64\d3d" -Force | Out-Null
+          Copy-Item $d3d "$portable\modules\x64\d3d"
+          $zip = "$env:GITHUB_WORKSPACE\deploy\Aerogram-windows-x64.zip"
+          Push-Location $packageBase
+          try {
+            & 7z a -tzip -mx=9 $zip Aerogram
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & 7z t $zip
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            $expectedPrefix = "Aerogram/$($application.Name)"
+            if ($entries -notcontains $expectedPrefix) { Write-Error 'The application executable is missing from the ZIP.'; exit 1 }
+            if ($entries -notcontains 'Aerogram/TelegramForcePortable/portable') { Write-Error 'The portable marker is missing from the ZIP.'; exit 1 }
+            foreach ($notice in @('Aerogram/LICENSE', 'Aerogram/LEGAL')) {
+              if ($entries -notcontains $notice) { Write-Error "Missing $notice"; exit 1 }
+            }
+            $forbidden = $entries | Where-Object { $_ -match '(^|/)(tdata|DesktopPrivate|test_TelegramForcePortable)(/|$)|custom_api_id|testagent|\.pdb$|\.log$' }
+            if ($forbidden) { Write-Error "Forbidden portable payload: $forbidden"; exit 1 }
+            $archive.Entries | Select-Object FullName, Length, CompressedLength | ConvertTo-Json | Set-Content "$env:EVIDENCE_DIR\zip-entries.json"
+          } finally { $archive.Dispose() }
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  Aerogram-windows-x64.zip" | Set-Content "$env:GITHUB_WORKSPACE\deploy\SHA256SUMS" -Encoding ascii
+          $manifest = [ordered]@{
+            source_commit = (git -C $env:SOURCE_DIR rev-parse HEAD)
+            configuration = 'Release'
+            architecture = 'x64'
+            application_binary = $application.Name
+            application_sha256 = (Get-FileHash $application.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            archive = 'Aerogram-windows-x64.zip'
+            archive_sha256 = $zipHash
+            api_test = $false
+            autoupdate_disabled = $true
+            release_test_harness = $false
+          }
+          $manifest | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE\deploy\manifest.json"
+          Get-Content "$env:EVIDENCE_DIR\submodule-status.txt" | Set-Content "$env:GITHUB_WORKSPACE\deploy\submodule-status.txt"
+          Get-Item $zip | Select-Object Name, Length
+          Get-Content "$env:GITHUB_WORKSPACE\deploy\SHA256SUMS"
+
+      - name: Upload the portable release
+        uses: actions/upload-artifact@v7
+        with:
+          name: aerogram-windows-x64-release-portable
+          path: |
+            deploy/Aerogram-windows-x64.zip
+            deploy/SHA256SUMS
+            deploy/manifest.json
+            deploy/submodule-status.txt
+          if-no-files-found: error
+          retention-days: 14
